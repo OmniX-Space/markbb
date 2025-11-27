@@ -1,0 +1,577 @@
+/*
+ * MarkBB - A BBCode and markdown parser for JavaScript
+ *
+ * Copyright (c) 2025 MoeCinnamo
+ * 
+ * This file contains markbb.js, a BBCode and markdown parser for JavaScript.
+ * 
+ */
+
+// Markdown and BBCode parser
+function markbb(text) {
+    let html = markdown(text);
+
+    const protectedMap = {};
+    let protectCounter = 0;
+
+    html = html.replace(/<pre\b[^>]*>[\s\S]*?<\/pre>/gi, match => {
+        const id = `__PROTECTED_PRE_${protectCounter++}__`;
+        protectedMap[id] = match;
+        return id;
+    });
+
+    html = html.replace(/<code\b[^>]*>(?![\s\S]*?<\/pre>)[\s\S]*?<\/code>/gi, match => {
+        const id = `__PROTECTED_CODE_${protectCounter++}__`;
+        protectedMap[id] = match;
+        return id;
+    });
+
+    html = bbcode(html);
+
+    html = html.replace(/__PROTECTED_(?:PRE|CODE)_\d+__/g, match => {
+        return protectedMap[match] || match;
+    });
+
+    return html;
+}
+
+// Markdown parser
+function markdown(text) {
+    const lines = text.split(/\r\n|\n|\r/);
+    const result = [];
+    let currentParagraph = [];
+    let inCodeBlock = false;
+    let codeBlockLanguage = '';
+    let codeBlockContent = [];
+    let currentBlockquote = [];
+    let listStack = [];
+
+    function processInlineMarkdown(content) {
+        if (!content) return content;
+
+        let processed = content.replace(/\\([*_~`[\]!])/g, 'MARKDOWN_ESC$1');
+
+        processed = processed.replace(/`(.*?)`/g, function (match, p1) {
+            if (p1.trim() === '') return match;
+            const escapedCode = p1.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;');
+            return `<code>${escapedCode}</code>`;
+        });
+
+        processed = processed.replace(/~~(.*?)~~/g, function (match, p1) {
+            if (p1.trim() === '') return match;
+            return '<del>' + processInlineMarkdown(p1) + '</del>';
+        });
+
+        processed = processed.replace(/\*\*(.*?)\*\*/g, function (match, p1) {
+            if (p1.trim() === '') return match;
+            return '<strong>' + processInlineMarkdown(p1) + '</strong>';
+        });
+
+        processed = processed.replace(/__(.*?)__/g, function (match, p1) {
+            if (p1.trim() === '') return match;
+            return '<strong>' + processInlineMarkdown(p1) + '</strong>';
+        });
+
+        processed = processed.replace(/\*(?!\*)(.*?)\*(?!\*)/g, function (match, p1) {
+            if (p1.trim() === '') return match;
+            return '<em>' + processInlineMarkdown(p1) + '</em>';
+        });
+
+        processed = processed.replace(/_(?!_)(.*?)_(?!_)/g, function (match, p1) {
+            if (p1.trim() === '') return match;
+            if (/^\w.*\w$/.test(p1)) return match;
+            return '<em>' + processInlineMarkdown(p1) + '</em>';
+        });
+
+        processed = processed.replace(/!\[(.*?)\]\((.*?)\)/g, function (match, alt, url) {
+            const escapedAlt = alt.replace(/"/g, '&quot;');
+            const escapedUrl = encodeURI(decodeURI(url.trim()));
+            return `<img src="${escapedUrl}" alt="${escapedAlt}" style="max-width:100%;height:auto;"/>`;
+        });
+
+        processed = processed.replace(/\[(.*?)\]\((.*?)\)/g, function (match, text, url) {
+            if (text.trim() === '') return match;
+            const escapedText = processInlineMarkdown(text);
+            const escapedUrl = encodeURI(decodeURI(url.trim()));
+            return `<a href="${escapedUrl}" target="_blank">${escapedText}</a>`;
+        });
+
+        processed = processed.replace(/\[(x|X| )\]/g, function (match, state) {
+            const checked = state.trim().toLowerCase() === 'x';
+            return `<input type="checkbox" disabled ${checked ? 'checked' : ''}>`;
+        });
+
+        processed = processed.replace(/MARKDOWN_ESC([*_~`[\]!])/g, '$1');
+
+        return processed;
+    }
+
+    function flushCodeBlock() {
+        if (inCodeBlock && codeBlockContent.length > 0) {
+            const codeContent = codeBlockContent.join('\n')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/&/g, '&amp;');
+
+            if (codeBlockLanguage) {
+                result.push(`<pre><code class="language-${codeBlockLanguage}">${codeContent}</code></pre>`);
+            } else {
+                result.push(`<pre><code>${codeContent}</code></pre>`);
+            }
+
+            codeBlockContent = [];
+            codeBlockLanguage = '';
+            inCodeBlock = false;
+        }
+    }
+
+    function flushBlockquote() {
+        if (currentBlockquote.length > 0) {
+            const processedQuote = currentBlockquote.map(line =>
+                processInlineMarkdown(line.trim())
+            ).join('\n');
+            result.push(`<blockquote>${processedQuote}</blockquote>`);
+            currentBlockquote = [];
+        }
+    }
+
+    function processListItems(items, isOrdered) {
+        if (items.length === 0) return '';
+
+        const listItems = items.map(item => {
+            const lines = item.content.split('\n');
+            let processedContent = lines[0];
+
+            if (lines.length > 1) {
+                const remainingText = lines.slice(1).join('\n');
+                processedContent += `\n${remainingText}`;
+            }
+
+            return `<li>${processInlineMarkdown(processedContent.trim())}</li>`;
+        });
+
+        return isOrdered ?
+            `<ol>\n${listItems.join('\n')}\n</ol>` :
+            `<ul>\n${listItems.join('\n')}\n</ul>`;
+    }
+
+    function processTable(tableLines) {
+        if (tableLines.length < 2) return '';
+
+        const cleanedLines = tableLines.map(line => {
+            let trimmed = line.trim();
+            if (trimmed.startsWith('|')) trimmed = trimmed.substring(1);
+            if (trimmed.endsWith('|')) trimmed = trimmed.substring(0, trimmed.length - 1);
+            return trimmed.trim();
+        });
+
+        if (cleanedLines.length < 2) return '';
+
+        const headers = cleanedLines[0].split('|').map(h => h.trim()).filter(h => h);
+
+        const separatorLine = cleanedLines[1];
+        if (!/^\s*:?-+:?\s*(\|:?-+:?)*$/.test(separatorLine)) {
+            return '';
+        }
+
+        const alignments = separatorLine.split('|').map(a => {
+            const trimmed = a.trim();
+            if (trimmed.startsWith(':') && trimmed.endsWith(':')) return 'center';
+            if (trimmed.startsWith(':')) return 'left';
+            if (trimmed.endsWith(':')) return 'right';
+            return 'left';
+        }).filter(a => a);
+
+        const rows = cleanedLines.slice(2).map(line => {
+            return line.split('|').map(c => c.trim()).filter(c => c);
+        });
+
+        const headerCount = headers.length;
+        if (alignments.length < headerCount) {
+            while (alignments.length < headerCount) alignments.push('left');
+        }
+
+        let html = '<table>\n<thead>\n<tr>\n';
+        headers.forEach((header, i) => {
+            html += `<th style="text-align:${alignments[i] || 'left'}">${processInlineMarkdown(header)}</th>\n`;
+        });
+        html += '</tr>\n</thead>\n<tbody>\n';
+
+        rows.forEach(row => {
+            if (row.length === 0) return;
+            html += '<tr>\n';
+            for (let i = 0; i < headerCount; i++) {
+                const cell = row[i] || '';
+                html += `<td style="text-align:${alignments[i] || 'left'}">${processInlineMarkdown(cell)}</td>\n`;
+            }
+            html += '</tr>\n';
+        });
+
+        html += '</tbody>\n</table>';
+        return html;
+    }
+
+    function isCodeBlockDelimiter(line) {
+        return line.trim().startsWith('```');
+    }
+
+    function isBlockquoteLine(line) {
+        return line.trim().startsWith('>');
+    }
+
+    function isHorizontalRule(line) {
+        const trimmed = line.trim();
+        return /^([-*_]){3,}\s*$/.test(trimmed);
+    }
+
+    function isListItem(line) {
+        const trimmed = line.trim();
+        return /^\s*([-+*]|(\d+\.))\s+/.test(trimmed);
+    }
+
+    function isTableLine(line) {
+        const trimmed = line.trim();
+        const pipeCount = (trimmed.match(/\|/g) || []).length;
+        return pipeCount >= 2 &&
+            !isCodeBlockDelimiter(line) &&
+            !isBlockquoteLine(line) &&
+            !isHorizontalRule(line) &&
+            !isListItem(line) &&
+            !trimmed.startsWith('#');
+    }
+
+    function isTableSeparatorLine(line) {
+        const trimmed = line.trim();
+        let content = trimmed;
+        if (content.startsWith('|')) content = content.substring(1);
+        if (content.endsWith('|')) content = content.substring(0, content.length - 1);
+        content = content.trim();
+
+        return /^:?-+:?\s*(\|:?-+:?)*$/.test(content) ||
+            /^\s*:?-+:?\s*(\|:?-+:?)*\s*$/.test(content);
+    }
+
+    let tableBuffer = [];
+    let inTable = false;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmedLine = line.trim();
+
+        if (isCodeBlockDelimiter(line)) {
+            if (inCodeBlock) {
+                flushCodeBlock();
+            } else {
+                inCodeBlock = true;
+                codeBlockLanguage = line.trim().substring(3).trim();
+
+                if (inTable) {
+                    if (tableBuffer.length >= 2 && isTableSeparatorLine(tableBuffer[1])) {
+                        const tableHTML = processTable(tableBuffer);
+                        if (tableHTML) {
+                            result.push(tableHTML);
+                        } else {
+                            const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+                            result.push(`<p>${tableContent}</p>`);
+                        }
+                    } else {
+                        const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+                        result.push(`<p>${tableContent}</p>`);
+                    }
+                    tableBuffer = [];
+                    inTable = false;
+                }
+
+                flushBlockquote();
+                if (currentParagraph.length > 0) {
+                    const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+                    result.push(`<p>${paragraphContent}</p>`);
+                    currentParagraph = [];
+                }
+            }
+            continue;
+        }
+
+        if (inCodeBlock) {
+            codeBlockContent.push(line);
+            continue;
+        }
+
+        if (!inTable && isTableLine(line)) {
+            flushBlockquote();
+            if (currentParagraph.length > 0) {
+                const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+                result.push(`<p>${paragraphContent}</p>`);
+                currentParagraph = [];
+            }
+
+            tableBuffer = [line];
+            inTable = true;
+            continue;
+        } else if (inTable) {
+            if (isTableLine(line) || isTableSeparatorLine(line) || trimmedLine === '') {
+                tableBuffer.push(line);
+                continue;
+            } else {
+                if (tableBuffer.length >= 2 && isTableSeparatorLine(tableBuffer[1])) {
+                    flushBlockquote();
+                    const tableHTML = processTable(tableBuffer);
+                    if (tableHTML) {
+                        result.push(tableHTML);
+                    } else {
+                        const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+                        result.push(`<p>${tableContent}</p>`);
+                    }
+                } else {
+                    const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+                    result.push(`<p>${tableContent}</p>`);
+                }
+
+                tableBuffer = [];
+                inTable = false;
+
+                i--;
+                continue;
+            }
+        }
+
+        if (isHorizontalRule(line)) {
+            flushBlockquote();
+            if (currentParagraph.length > 0) {
+                const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+                result.push(`<p>${paragraphContent}</p>`);
+                currentParagraph = [];
+            }
+            result.push('<hr />');
+            continue;
+        }
+
+        if (isBlockquoteLine(line)) {
+            if (currentParagraph.length > 0) {
+                const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+                result.push(`<p>${paragraphContent}</p>`);
+                currentParagraph = [];
+            }
+            currentBlockquote.push(line.substring(line.indexOf('>') + 1));
+            continue;
+        } else if (currentBlockquote.length > 0) {
+            flushBlockquote();
+        }
+
+        if (isListItem(line)) {
+            flushBlockquote();
+            if (currentParagraph.length > 0) {
+                const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+                result.push(`<p>${paragraphContent}</p>`);
+                currentParagraph = [];
+            }
+
+            const listItems = [];
+            let j = i;
+            let isOrdered = /^\s*\d+\./.test(trimmedLine);
+
+            while (j < lines.length && isListItem(lines[j])) {
+                const listItemLine = lines[j].trim();
+                const marker = listItemLine.match(/^\s*([-+*]|\d+\.)\s+/)[0];
+                const content = listItemLine.substring(marker.length);
+                listItems.push({ content });
+                j++;
+            }
+
+            result.push(processListItems(listItems, isOrdered));
+            i = j - 1;
+            continue;
+        }
+
+        let headingLevel = 0;
+        if (trimmedLine.startsWith('#')) {
+            let count = 0;
+            while (count < trimmedLine.length && trimmedLine[count] === '#') {
+                count++;
+            }
+            if (count <= 6 && count < trimmedLine.length && trimmedLine[count] === ' ') {
+                headingLevel = count;
+            }
+        }
+
+        if (headingLevel > 0) {
+            flushBlockquote();
+            if (currentParagraph.length > 0) {
+                const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+                result.push(`<p>${paragraphContent}</p>`);
+                currentParagraph = [];
+            }
+            const content = processInlineMarkdown(trimmedLine.substring(headingLevel + 1).trim());
+            result.push(`<h${headingLevel}>${content}</h${headingLevel}>`);
+            continue;
+        }
+
+        if (trimmedLine === '') {
+            flushBlockquote();
+            if (inTable) {
+                if (tableBuffer.length >= 2 && isTableSeparatorLine(tableBuffer[1])) {
+                    const tableHTML = processTable(tableBuffer);
+                    if (tableHTML) {
+                        result.push(tableHTML);
+                    } else {
+                        const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+                        result.push(`<p>${tableContent}</p>`);
+                    }
+                } else {
+                    const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+                    result.push(`<p>${tableContent}</p>`);
+                }
+                tableBuffer = [];
+                inTable = false;
+            }
+            if (currentParagraph.length > 0) {
+                const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+                result.push(`<p>${paragraphContent}</p>`);
+                currentParagraph = [];
+            }
+            continue;
+        }
+
+        currentParagraph.push(line);
+    }
+
+    flushCodeBlock();
+    flushBlockquote();
+    if (inTable && tableBuffer.length >= 2 && isTableSeparatorLine(tableBuffer[1])) {
+        const tableHTML = processTable(tableBuffer);
+        if (tableHTML) {
+            result.push(tableHTML);
+        } else {
+            const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+            result.push(`<p>${tableContent}</p>`);
+        }
+    } else if (inTable) {
+        const tableContent = processInlineMarkdown(tableBuffer.join('\n'));
+        result.push(`<p>${tableContent}</p>`);
+    }
+    if (currentParagraph.length > 0) {
+        const paragraphContent = processInlineMarkdown(currentParagraph.join(' '));
+        result.push(`<p>${paragraphContent}</p>`);
+    }
+
+    return result.join('\r\n') + (result.length > 0 ? '\r\n' : '');
+}
+
+// BBCode parser
+function bbcode(text) {
+    if (!text || typeof text !== 'string') {
+        return '';
+    }
+
+    function escapeHtml(unsafe) {
+        return unsafe
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    function sanitizeUrl(url) {
+        url = url.trim();
+
+        if (!url.match(/^[a-zA-Z]+:\/\//)) {
+            url = 'https://' + url;
+        }
+
+        if (url.match(/^(javascript|data|vbscript):/i)) {
+            return '#';
+        }
+        return escapeHtml(url);
+    }
+
+    let result = text;
+
+    const simpleTags = ['b', 'i', 'u', 's', 'sup', 'sub'];
+    simpleTags.forEach(tag => {
+        const regex = new RegExp(`\\[(${tag})\\](.*?)\\[\\/${tag}\\]`, 'gs');
+        result = result.replace(regex, `<${tag}>$2</${tag}>`);
+    });
+
+    result = result.replace(/\[size=(\d+?)\](.*?)\[\/size\]/gs, (match, size, content) => {
+        const validSize = Math.min(Math.max(parseInt(size, 10), 8), 72);
+        return `<span style="font-size:${validSize}px">${content}</span>`;
+    });
+
+    result = result.replace(/\[color=(#[0-9a-fA-F]{3,6}|[a-zA-Z]+|rgba?\([^)]+\))\](.*?)\[\/color\]/gs,
+        '<span style="color:$1">$2</span>');
+
+    result = result.replace(/\[font=([^"'<>]+?)\](.*?)\[\/font\]/gs,
+        '<span style="font-family:$1">$2</span>');
+
+    result = result.replace(/\[url\](.*?)\[\/url\]/gs, (match, url) => {
+        const cleanUrl = sanitizeUrl(url);
+        return `<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
+    });
+
+    result = result.replace(/\[url=(.*?)\](.*?)\[\/url\]/gs, (match, url, text) => {
+        const cleanUrl = sanitizeUrl(url);
+        return `<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(text)}</a>`;
+    });
+
+    result = result.replace(/\[img\](.*?)\[\/img\]/gs, (match, url) => {
+        const cleanUrl = sanitizeUrl(url);
+        if (!cleanUrl.startsWith('https://') && !cleanUrl.startsWith('http://')) {
+            return '[Invalid Picture]';
+        }
+        return `<img src="${cleanUrl}" style="max-width:100%;height:auto;" />`;
+    });
+
+    result = result.replace(/\[code\](.*?)\[\/code\]/gs, (match, content) => {
+        return `<pre><code>${escapeHtml(content)}</code></pre>`;
+    });
+
+    result = result.replace(/\[quote\](.*?)\[\/quote\]/gs, '<blockquote>$1</blockquote>');
+
+    result = result.replace(/\[list\]\s*([\s\S]*?)\s*\[\/list\]/gs, (match, content) => {
+        let items = content.replace(/\[\*\]/g, '</li><li>');
+        items = items.replace(/^<\/li>|<li>$/g, '');
+        return `<ul><li>${items}</li></ul>`;
+    });
+
+    result = result.replace(/\[list=1\]\s*([\s\S]*?)\s*\[\/list\]/gs, (match, content) => {
+        let items = content.replace(/\[\*\]/g, '</li><li>');
+        items = items.replace(/^<\/li>|<li>$/g, '');
+        return `<ol><li>${items}</li></ol>`;
+    });
+
+    result = result.replace(/\[table\]([\s\S]*?)\[\/table\]/gs, '<table class="bbcode-table">$1</table>');
+    result = result.replace(/\[tr\]([\s\S]*?)\[\/tr\]/gs, '<tr>$1</tr>');
+    result = result.replace(/\[td\]([\s\S]*?)\[\/td\]/gs, '<td>$1</td>');
+
+    result = result.replace(/<table class="bbcode-table">/g,
+        '<table class="bbcode-table" style="border-collapse:collapse;width:100%;border:1px solid #ddd;">');
+    result = result.replace(/<td>/g, '<td style="border:1px solid #ddd;padding:8px;">');
+
+    let hideCounter = 0;
+    result = result.replace(/\[hide\]([\s\S]*?)\[\/hide\]/gs, (match, content) => {
+        const id = `hide-content-${hideCounter++}`;
+        return `<div class="bbcode-hide">
+            <button onclick="document.getElementById('${id}').style.display = (document.getElementById('${id}').style.display === 'none' ? 'block' : 'none')">Show/Hide</button>
+            <div id="${id}" style="display:none;margin-top:5px;padding:10px;background-color:#f5f5f5;border:1px solid #ddd;">
+                ${content}
+            </div>
+        </div>`;
+    });
+
+    result = result.replace(/\[media\](.*?)\[\/media\]/gs, (match, url) => {
+        const cleanUrl = sanitizeUrl(url);
+        if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be') ||
+            cleanUrl.includes('vimeo.com') || cleanUrl.match(/\.(mp4|webm|ogg)$/)) {
+            return `<div class="bbcode-media">
+                <a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">Watch Video</a>
+                <br>
+                <small>${escapeHtml(url)}</small>
+            </div>`;
+        } else {
+            return `<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
+        }
+    });
+
+    return result;
+}
